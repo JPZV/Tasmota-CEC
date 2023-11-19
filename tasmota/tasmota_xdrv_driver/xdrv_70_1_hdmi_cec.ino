@@ -34,6 +34,18 @@ void (* const HDMICommand[])(void) PROGMEM = {
   &CmndHDMIType, &CmndHDMIAddr,
   };
 
+#define HDMI_CEC_TARGET_HEX   0xFF
+#define HDMI_CEC_POWER_HEX    0x90
+#define HDMI_CEC_TURN_ON_HEX  0x04
+#define HDMI_CEC_TURN_OFF_HEX 0x36
+#define HDMI_CEC_VOLUME_HEX   0x44
+#define HDMI_CEC_VOL_UP_HEX   0x41
+#define HDMI_CEC_VOL_DOWN_HEX 0x42
+#define HDMI_CEC_SOURCE_HEX   0x82
+
+enum PowerStates { UNKNOWN_STATE = -1, ON, STANDBY, STANDBY_TO_ON, ON_TO_STANDBY, MAX_STATE };
+
+static char last_power_state = UNKNOWN_STATE;
 
 // This is called after the logical address has been allocated
 void HDMI_OnReady(class CEC_Device* self, int logical_address) {
@@ -48,6 +60,10 @@ void HDMI_OnReceive(class CEC_Device *self, int32_t from, int32_t to, uint8_t* b
   Response_P(PSTR("{\"HdmiReceived\":{\"From\":%i,\"To\":%i,\"Data\":\"%*_H\"}}"), from, to, len, buf);
   if (to == self->getLogicalAddress() || to == 0x0F) {
     MqttPublishPrefixTopic_P(TELE, PSTR(D_RSLT_SENSOR), Settings->flag.mqtt_sensor_retain);
+  }
+  if (len == 2 && buf[0] == HDMI_CEC_POWER_HEX)
+  {
+    last_power_state = buf[1] < MAX_STATE ? buf[1] : UNKNOWN_STATE;
   }
   XdrvRulesProcess(0);     // apply rules
 }
@@ -294,6 +310,70 @@ void CmndHDMIAddr(void) {
   Response_P(PSTR("{\"%s\":\"0x%04X\"}"), XdrvMailbox.command, hdmi_addr);
 }
 
+void HdmiCecShow(void) {
+  if (HDMI_CEC_device) {
+    WSContentSend_P(HTTP_TABLE100);
+    WSContentSend_P(PSTR("<tr><td style='width:100%%;text-align:center;font-weight:bold;font-size:62px'>%s</td></tr></table>"), last_power_state == ON ? PSTR(D_ON) : PSTR(D_OFF));
+  }
+}
+
+void HdmiCecAddButton(void) {
+  if (HDMI_CEC_device) {
+    WSContentSend_P(HTTP_TABLE100);
+    WSContentSend_P(PSTR("<tr>"));
+    WSContentSend_P(PSTR("<td style='width:25%%' colspan='4'><button onclick='la(\"&toggle=1\");'>%s</button></td>"), D_BUTTON_TOGGLE);
+    WSContentSend_P(PSTR("</tr><tr>"));
+    WSContentSend_P(PSTR("<td style='width:25%%' colspan='2'><button onclick='la(\"&volume=1\");'>%s+</button></td>"), D_VOLUME);
+    WSContentSend_P(PSTR("<td style='width:25%%' colspan='2'><button onclick='la(\"&volume=0\");'>%s-</button></td>"), D_VOLUME);
+    WSContentSend_P(PSTR("</tr><tr>"));
+    char number[4];
+    for (uint32_t i = 1; i <= 4; i++) {
+      WSContentSend_P(PSTR("<td style='width:25%%'><button onclick='la(\"&i=%d\");'>HDMI %s</button></td>"), i,  // &i is related to WebGetArg("i", tmp, sizeof(tmp));
+        itoa(i, number, 10));
+    }
+    WSContentSend_P(PSTR("</tr></table>"));
+  }
+}
+
+void HdmiCecWebGetArg(void) {
+  char tmp[8];
+
+  WebGetArg(PSTR("i"), tmp, sizeof(tmp));
+  if (strlen(tmp))
+  {
+    SBuffer buf(4);
+    buf.add8(HDMI_CEC_TARGET_HEX);
+    buf.add8(HDMI_CEC_SOURCE_HEX);
+    buf.add8(0x10 * atoi(tmp));
+    buf.add8(0x00);
+    HDMI_CEC_device->transmitRaw(buf.buf(), buf.len());
+    return;
+  }
+
+  WebGetArg(PSTR("toggle"), tmp, sizeof(tmp));
+  if (strlen(tmp)) {
+    SBuffer buf(2);
+    buf.add8(HDMI_CEC_TARGET_HEX);
+    if (last_power_state == ON) {
+      buf.add8(HDMI_CEC_TURN_ON_HEX);
+    } else if (last_power_state == STANDBY) {
+      buf.add8(HDMI_CEC_TURN_OFF_HEX);
+    }
+    HDMI_CEC_device->transmitRaw(buf.buf(), buf.len());
+    return;
+  }
+  
+  WebGetArg(PSTR("volume"), tmp, sizeof(tmp));
+  if (strlen(tmp)) {
+    SBuffer buf(3);
+    buf.add8(HDMI_CEC_TARGET_HEX);
+    buf.add8(HDMI_CEC_VOLUME_HEX);
+    buf.add8(atoi(tmp) ? HDMI_CEC_VOL_UP_HEX : HDMI_CEC_VOL_DOWN_HEX);
+    HDMI_CEC_device->transmitRaw(buf.buf(), buf.len());
+    return;
+  }
+}
+
 /*********************************************************************************************\
  * Interface
 \*********************************************************************************************/
@@ -316,6 +396,15 @@ bool Xdrv70(uint32_t function)
       if (HDMI_CEC_device) {
         result = DecodeCommand(kHDMICommands, HDMICommand);
       }
+      break;
+    case FUNC_WEB_SENSOR:
+      HdmiCecShow();
+      break;
+    case FUNC_WEB_ADD_MAIN_BUTTON:
+      HdmiCecAddButton();
+      break;
+    case FUNC_WEB_GET_ARG:
+      HdmiCecWebGetArg();
       break;
   }
   return result;
